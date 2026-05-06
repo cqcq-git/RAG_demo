@@ -52,6 +52,8 @@ def initialize_database():
     else:
         print("⚠️ Error: doc.md not found.")
 
+initialize_database()
+
 # --- 3. DATA MODELS ---
 class QueryRequest(BaseModel):
     prompt: str
