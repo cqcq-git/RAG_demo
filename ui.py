@@ -1,6 +1,6 @@
 import chainlit as cl
 # We import your existing logic from app.py
-from app import get_answer 
+from app import build_rag_prompt, stream_answer_chunks
 
 @cl.on_chat_start
 async def start():
@@ -10,24 +10,19 @@ async def start():
 
 @cl.on_message
 async def main(message: cl.Message):
-    # 1. Show a "loading" spinner while the AI thinks
     msg = cl.Message(content="")
     await msg.send()
 
-    # 2. Get the settings we stored
-    top_k = cl.user_session.get("top_k")
+    system_prompt, user_prompt, sources = await cl.make_async(build_rag_prompt)(
+        message.content,
+        cl.user_session.get("top_k"),
+    )
 
-    # 3. Call your RAG logic (from app.py)
-    # Note: If your get_answer isn't async, we run it in a thread to keep the UI responsive
-    answer, sources = await cl.make_async(get_answer)(message.content, top_k)
+    for token in stream_answer_chunks(system_prompt, user_prompt):
+        await msg.stream_token(token)
 
-    # 4. Format the sources into a nice list
-    source_elements = [
+    msg.elements = [
         cl.Text(name=f"Source {i+1}", content=s, display="side") 
         for i, s in enumerate(sources)
     ]
-
-    # 5. Update the message with the final answer and sources
-    msg.content = answer
-    msg.elements = source_elements
     await msg.update()

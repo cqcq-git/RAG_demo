@@ -1,15 +1,17 @@
 import os
 import uuid
-import re  # [NEW] For BM25 tokenization
-from typing import List
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+import re
+import json
+import time
+from typing import Iterator
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from google import genai
 import chromadb
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from rank_bm25 import BM25Okapi  # [NEW] BM25 Library
+from rank_bm25 import BM25Okapi
 import ollama
 
 # --- 1. SETUP & CONFIGURATION ---
@@ -21,7 +23,6 @@ rerank_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L12-v2', local_files_
 
 google_client = genai.Client()
 
-# [NEW] In-memory storage for BM25
 bm25_index = None
 all_chunks = []
 
@@ -31,14 +32,13 @@ collection = chroma_client.get_or_create_collection(name="RAG_demo_collection")
 
 # --- 2. THE INGESTION ENGINE ---
 def initialize_database():
-    global bm25_index, all_chunks  # [NEW] Access globals
+    global bm25_index, all_chunks
     
     if os.path.exists("doc.md"):
         with open("doc.md", 'r') as file:
             content = file.read()
         all_chunks = [chunk.strip() for chunk in content.split("\n\n") if chunk.strip()]
         
-        # [NEW] Initialize BM25 Index
         tokenized_corpus = [re.sub(r'[^\w\s]', '', c.lower()).split() for c in all_chunks]
         bm25_index = BM25Okapi(tokenized_corpus)
         print(f"✅ BM25 Index built with {len(all_chunks)} chunks.")
@@ -59,27 +59,23 @@ class QueryRequest(BaseModel):
     prompt: str
     top_k: int = 5
 
-class QueryResponse(BaseModel):
-    answer: str
-    sources: List[str]
-
 # --- 4. CORE RAG LOGIC ---
-def get_answer(query: str, top_k: int):
+def build_rag_prompt(query: str, top_k: int) -> tuple[str, str, list[str]]:
     # --- 4a. Hybrid Retrieval ---
     # 1. Vector Search
     query_vec = embed_model.encode(query, normalize_embeddings=True).tolist()
     vector_results = collection.query(query_embeddings=[query_vec], n_results=top_k)
     vector_chunks = vector_results['documents'][0]
     
-    # 2. [NEW] BM25 Search
+    # 2. BM25 Search
     tokenized_query = re.sub(r'[^\w\s]', '', query.lower()).split()
     bm25_chunks = bm25_index.get_top_n(tokenized_query, all_chunks, n=top_k)
     
-    # 3. [NEW] Combine and Deduplicate
+    # 3. Combine and Deduplicate
     combined_chunks = list(set(vector_chunks + bm25_chunks))
     
     if not combined_chunks:
-        return "I don't have any context in my database to answer that.", []
+        return "", "I don't have any context in my database to answer that.", []
 
     # --- 4b. Reranking ---
     pairs = [(query, chunk) for chunk in combined_chunks]
@@ -92,46 +88,77 @@ def get_answer(query: str, top_k: int):
     system_prompt = "You are a helpful assistant. Answer strictly using the provided context. If the answer is not in the context, say you don't know."
     user_prompt = f"Context:\n{context_text}\n\nQuestion: {query}"
 
-    # --- 4d. THE SWITCH ---
+    return system_prompt, user_prompt, top_chunks
+
+
+def stream_answer_chunks(system_prompt: str, user_prompt: str) -> Iterator[str]:
+    if not system_prompt:
+        yield user_prompt
+        return
+
     if LLM_MODE == "ollama":
-        print(f"🤖 Using Local model (Ollama) with context length: {len(context_text)}")
-        try:
-            response = ollama.chat(
-                model='qwen3:4b',
-                messages=[
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': user_prompt},
-                ]
-            )
-            answer = response['message']['content']
-        except Exception as e:
-            answer = f"Ollama Error: {str(e)}"
+        print(f"🤖 Streaming from Local model (Ollama)")
+        response = ollama.chat(
+            model='qwen3:4b',
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            stream=True
+        )
+        for chunk in response:
+            token = chunk.get('message', {}).get('content', '')
+            if token:
+                yield token
     else:
-        print("☁️ Using Google Gemini")
+        print("☁️ Streaming from Google Gemini")
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
-        response = google_client.models.generate_content(
+        response = google_client.models.generate_content_stream(
             model="gemini-2.0-flash",
             contents=full_prompt
         )
-        answer = response.text
+        for chunk in response:
+            token = getattr(chunk, "text", None)
+            if token:
+                yield token
 
-    return answer, top_chunks
 
-# --- 5. LIFESPAN & APP SETUP ---
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("🚀 Project Engine starting...")
-    initialize_database() 
-    yield
-    print("🛑 Engine shutting down.")
-    
-app = FastAPI(title="RAG demo API", lifespan=lifespan)
+def sse_event(event: str, data) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def stream_rag_response(query: str, top_k: int) -> Iterator[str]:
+    try:
+        system_prompt, user_prompt, top_chunks = build_rag_prompt(query, top_k)
+        yield sse_event("sources", top_chunks)
+
+        output_text = ""
+        started_at = time.perf_counter()
+        for token in stream_answer_chunks(system_prompt, user_prompt):
+            output_text += token
+            yield sse_event("token", token)
+
+        duration = time.perf_counter() - started_at
+        output_tokens = len(output_text.split())
+        yield sse_event("metrics", {
+            "output_tokens_approx": output_tokens,
+            "generation_seconds": round(duration, 3),
+            "tokens_per_second_approx": round(output_tokens / duration, 2) if duration else None,
+        })
+        yield sse_event("done", True)
+    except Exception as e:
+        yield sse_event("error", f"RAG Error: {str(e)}")
+
+app = FastAPI(title="RAG demo API")
 
 # --- 6. API ENDPOINTS ---
-@app.post("/ask", response_model=QueryResponse)
+@app.post("/ask")
 async def ask_question(request: QueryRequest):
-    try:
-        answer, sources = get_answer(request.prompt, request.top_k)
-        return QueryResponse(answer=answer, sources=sources)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"RAG Error: {str(e)}")
+    return StreamingResponse(
+        stream_rag_response(request.prompt, request.top_k),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
